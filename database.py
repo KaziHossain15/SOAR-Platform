@@ -291,3 +291,44 @@ def update_alert_status(
     except Exception as exc:
         logger.exception("Failed to update alert status uid=%s", gmail_uid)
         raise DatabaseError(f"Failed to update alert status: {exc}") from exc
+
+
+def update_alert_vt(
+    client: Client,
+    gmail_uid: str,
+    *,
+    vt_score: int = 0,
+    vt_malicious: int = 0,
+    vt_suspicious: int = 0,
+    vt_total: int = 0,
+    vt_urls: Optional[list[str]] = None,
+    vt_link: Optional[str] = None,
+) -> dict[str, Any]:
+    """Persist VirusTotal fields for an existing alert."""
+    payload = {
+        "vt_score": int(vt_score or 0),
+        "vt_malicious": int(vt_malicious or 0),
+        "vt_suspicious": int(vt_suspicious or 0),
+        "vt_total": int(vt_total or 0),
+        "vt_urls": list(vt_urls or []),
+        "vt_link": vt_link,
+        "updated_at": _utc_now_iso(),
+    }
+    try:
+        response = (
+            client.table(TABLE_ALERTS)
+            .update(payload)
+            .eq("gmail_uid", gmail_uid)
+            .execute()
+        )
+        row = (response.data or [None])[0]
+        logger.info(
+            "Updated VT fields gmail_uid=%s vt_score=%s urls=%s",
+            gmail_uid,
+            vt_score,
+            len(vt_urls or []),
+        )
+        return row or {"gmail_uid": gmail_uid, **payload}
+    except Exception as exc:
+        logger.exception("Failed to update VT fields uid=%s", gmail_uid)
+        raise DatabaseError(f"Failed to update VirusTotal fields: {exc}") from exc

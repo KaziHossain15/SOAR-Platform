@@ -9,7 +9,7 @@ from __future__ import annotations
 import email
 import imaplib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from email.header import decode_header, make_header
 from email.message import Message
 from typing import Optional
@@ -39,6 +39,8 @@ class EmailMessage:
     sender: str
     subject: str
     body: str
+    html: str = ""
+    urls: list[str] = field(default_factory=list)
 
 
 class GmailClient:
@@ -307,12 +309,19 @@ class GmailClient:
             return None
 
         msg = email.message_from_bytes(raw)
+        subject = _header_value(msg, "Subject") or "(no subject)"
+        body, html = _extract_body_and_html(msg)
+        from virustotal import extract_urls
+
+        urls = extract_urls(subject, body, html, limit=20)
         return EmailMessage(
             gmail_uid=str(uid),
             message_id=_header_value(msg, "Message-ID") or f"uid-{uid}",
             sender=_header_value(msg, "From") or "unknown",
-            subject=_header_value(msg, "Subject") or "(no subject)",
-            body=_extract_body(msg),
+            subject=subject,
+            body=body,
+            html=html,
+            urls=urls,
         )
 
     # ------------------------------------------------------------------
@@ -612,6 +621,12 @@ def _header_value(msg: Message, name: str) -> str:
 
 def _extract_body(msg: Message) -> str:
     """Extract a plain-text body, falling back to stripped HTML."""
+    body, _html = _extract_body_and_html(msg)
+    return body
+
+
+def _extract_body_and_html(msg: Message) -> tuple[str, str]:
+    """Return ``(plain_or_stripped_text, raw_html)`` for link scanning."""
     plain_parts: list[str] = []
     html_parts: list[str] = []
 
@@ -635,11 +650,14 @@ def _extract_body(msg: Message) -> str:
         else:
             plain_parts.append(payload)
 
+    html = "\n".join(html_parts).strip()
     if plain_parts:
-        return "\n".join(plain_parts).strip()
-    if html_parts:
-        return _strip_html("\n".join(html_parts)).strip()
-    return ""
+        body = "\n".join(plain_parts).strip()
+    elif html:
+        body = _strip_html(html).strip()
+    else:
+        body = ""
+    return body, html
 
 
 def _decode_payload(part: Message) -> str:
@@ -655,7 +673,14 @@ def _decode_payload(part: Message) -> str:
 
 
 def _strip_html(html: str) -> str:
+    """Strip tags but keep discovered http(s) links appended for triage/VT."""
+    from virustotal import extract_urls
+
+    preserved = extract_urls(html, limit=50)
     text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html)
     text = re.sub(r"(?s)<[^>]+>", " ", text)
-    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if preserved:
+        # Ensure link destinations survive even if only present in href=.
+        text = f"{text}\n" + "\n".join(preserved)
     return text

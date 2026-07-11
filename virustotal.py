@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import html as html_lib
 import json
 import re
 import time
@@ -26,6 +27,19 @@ MIN_INTERVAL_SECONDS = 1.0
 _URL_RE = re.compile(
     r"https?://[^\s<>\"'\)\]\}]+",
     re.IGNORECASE,
+)
+# HTML emails often only put destinations in attributes; stripping tags
+# would otherwise delete them.
+_HREF_RE = re.compile(
+    r"""(?:href|src)\s*=\s*["']\s*(https?://[^"'>\s]+)["']""",
+    re.IGNORECASE,
+)
+_SKIP_URL_PREFIXES = (
+    "mailto:",
+    "tel:",
+    "data:",
+    "cid:",
+    "javascript:",
 )
 
 
@@ -63,21 +77,46 @@ class VirusTotalScanResult:
         return self.malicious > 0
 
 
+def _normalize_url(url: str) -> str:
+    url = html_lib.unescape((url or "").strip())
+    url = url.rstrip(".,;:!?)]}>\"'")
+    return url
+
+
 def extract_urls(*texts: str, limit: int = MAX_URLS_PER_EMAIL) -> list[str]:
-    """Extract unique http(s) URLs from text snippets."""
+    """Extract unique http(s) URLs from plain text and HTML snippets.
+
+    Prefer ``href`` / ``src`` values from HTML so marketing and phishing
+    templates still yield links after the body is converted to text.
+    """
     found: list[str] = []
     seen: set[str] = set()
+
+    def _add(raw: str) -> bool:
+        url = _normalize_url(raw)
+        if not url:
+            return False
+        lower = url.lower()
+        if any(lower.startswith(p) for p in _SKIP_URL_PREFIXES):
+            return False
+        if not lower.startswith("http://") and not lower.startswith("https://"):
+            return False
+        if lower in seen:
+            return False
+        seen.add(lower)
+        found.append(url)
+        return True
+
     for text in texts:
         if not text:
             continue
+        # Attribute URLs first (HTML emails).
+        for match in _HREF_RE.findall(text):
+            if _add(match) and limit and len(found) >= limit:
+                return found
+        # Bare URLs in visible text / stripped bodies.
         for match in _URL_RE.findall(text):
-            url = match.rstrip(".,;:!?)]}>\"'")
-            key = url.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            found.append(url)
-            if limit and len(found) >= limit:
+            if _add(match) and limit and len(found) >= limit:
                 return found
     return found
 
@@ -100,6 +139,7 @@ def _vt_get(api_key: str, path: str) -> dict[str, Any]:
 def lookup_url(api_key: str, url: str) -> VirusTotalUrlResult:
     """Fetch existing VirusTotal analysis for a URL (no new upload)."""
     result = VirusTotalUrlResult(url=url)
+    result.permalink = f"https://www.virustotal.com/gui/url/{url_id(url)}"
     try:
         payload = _vt_get(api_key, f"/urls/{url_id(url)}")
         attrs = (payload.get("data") or {}).get("attributes") or {}
@@ -115,7 +155,6 @@ def lookup_url(api_key: str, url: str) -> VirusTotalUrlResult:
             + result.undetected
             + int(stats.get("timeout") or 0)
         )
-        result.permalink = f"https://www.virustotal.com/gui/url/{url_id(url)}"
     except urllib.error.HTTPError as exc:
         body = ""
         try:
@@ -164,10 +203,10 @@ class VirusTotalClient:
         self,
         subject: str,
         body: str,
-        *,
+        *extra_texts: str,
         scan_budget_remaining: Optional[int] = None,
     ) -> VirusTotalScanResult:
-        """Extract and look up URLs from an email."""
+        """Extract and look up URLs from an email (subject/body/HTML)."""
         aggregate = VirusTotalScanResult(enabled=self.enabled)
         if not self.enabled:
             aggregate.skipped_reason = "VIRUSTOTAL_API_KEY not configured"
@@ -176,7 +215,7 @@ class VirusTotalClient:
             aggregate.skipped_reason = "rate_limited"
             return aggregate
 
-        urls = extract_urls(subject, body, limit=MAX_URLS_PER_EMAIL)
+        urls = extract_urls(subject, body, *extra_texts, limit=MAX_URLS_PER_EMAIL)
         if not urls:
             aggregate.skipped_reason = "no_urls"
             return aggregate
@@ -224,17 +263,24 @@ def format_vt_score(alert_or_result: Any) -> str:
         if not alert_or_result.enabled:
             return "n/a (no API key)"
         if alert_or_result.skipped_reason == "no_urls":
-            return "n/a (no links)"
+            return "n/a (no links found)"
         if not alert_or_result.urls_checked:
             return f"n/a ({alert_or_result.skipped_reason or 'skipped'})"
         total = alert_or_result.total_engines or 0
         return f"{alert_or_result.vt_score}/{total} malicious"
 
-    malicious = int(alert_or_result.get("vt_malicious") or alert_or_result.get("vt_score") or 0)
+    malicious = int(
+        alert_or_result.get("vt_malicious")
+        or alert_or_result.get("vt_score")
+        or 0
+    )
     total = int(alert_or_result.get("vt_total") or 0)
     checked = alert_or_result.get("vt_urls") or []
-    if not checked and malicious == 0 and total == 0:
-        return "n/a"
-    if total:
-        return f"{malicious}/{total} malicious"
-    return str(malicious)
+    vt_link = alert_or_result.get("vt_link") or ""
+    if vt_link == "no-links":
+        return "n/a (no links found)"
+    if checked or total:
+        if total:
+            return f"{malicious}/{total} malicious"
+        return f"{malicious} malicious (no prior VT report)"
+    return "n/a (not scanned — use Rescan VT)"

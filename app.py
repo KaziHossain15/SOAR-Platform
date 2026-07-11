@@ -33,6 +33,7 @@ from database import (
     insert_alert,
     insert_keyword_rule,
     update_alert_status,
+    update_alert_vt,
     update_keyword_rule,
 )
 from gmail_client import GmailClient, GmailError
@@ -211,7 +212,7 @@ def scan_inbox(settings: Settings, client: Client) -> dict[str, int]:
         for msg in messages:
             result = score_email(msg.subject, msg.body, rules)
             keyword_hit = is_suspicious(result, QUARANTINE_THRESHOLD)
-            urls = extract_urls(msg.subject, msg.body)
+            urls = list(msg.urls) or extract_urls(msg.subject, msg.body, msg.html)
             vt_result = VirusTotalScanResult(enabled=vt_client.enabled)
 
             if vt_client.enabled and vt_budget > 0:
@@ -219,6 +220,7 @@ def scan_inbox(settings: Settings, client: Client) -> dict[str, int]:
                     vt_result = vt_client.scan_email_urls(
                         msg.subject,
                         msg.body,
+                        msg.html,
                         scan_budget_remaining=vt_budget,
                     )
                     vt_budget = max(0, vt_budget - len(vt_result.urls_checked))
@@ -227,6 +229,7 @@ def scan_inbox(settings: Settings, client: Client) -> dict[str, int]:
                     vt_result = vt_client.scan_email_urls(
                         msg.subject,
                         msg.body,
+                        msg.html,
                         scan_budget_remaining=min(1, vt_budget),
                     )
                     vt_budget = max(0, vt_budget - len(vt_result.urls_checked))
@@ -296,6 +299,49 @@ def scan_inbox(settings: Settings, client: Client) -> dict[str, int]:
                 )
 
     return stats
+
+
+def rescan_alert_virustotal(
+    settings: Settings,
+    client: Client,
+    alert: dict[str, Any],
+) -> dict[str, Any]:
+    """Re-fetch the quarantined email, extract links, and update VT fields."""
+    if not settings.virustotal_api_key:
+        raise ConfigurationError(
+            "VIRUSTOTAL_API_KEY is not configured. Add it to `.env` and restart."
+        )
+
+    uid = str(alert.get("gmail_uid") or "")
+    message_id = alert.get("message_id") or ""
+    with GmailClient(settings) as gmail:
+        msg = gmail.fetch_message(uid, SOAR_REVIEW_FOLDER, message_id or None)
+    if msg is None:
+        raise GmailError(f"Could not load quarantined message uid={uid}")
+
+    vt_client = VirusTotalClient(settings.virustotal_api_key)
+    vt_result = vt_client.scan_email_urls(msg.subject, msg.body, msg.html)
+    permalink = ""
+    if vt_result.results:
+        permalink = vt_result.results[0].permalink
+    elif vt_result.worst_url:
+        permalink = f"https://www.virustotal.com/gui/url/{url_id(vt_result.worst_url)}"
+    elif vt_result.skipped_reason == "no_urls":
+        permalink = "no-links"
+
+    urls = vt_result.urls_checked or list(msg.urls) or extract_urls(
+        msg.subject, msg.body, msg.html, limit=5
+    )
+    return update_alert_vt(
+        client,
+        uid,
+        vt_score=vt_result.vt_score,
+        vt_malicious=vt_result.malicious,
+        vt_suspicious=vt_result.suspicious,
+        vt_total=vt_result.total_engines,
+        vt_urls=urls,
+        vt_link=permalink or None,
+    )
 
 
 def approve_alert(settings: Settings, client: Client, alert: dict[str, Any]) -> None:
@@ -525,7 +571,7 @@ def render_alert_card(
         )
         vt_link = alert.get("vt_link") or ""
         vt_urls = alert.get("vt_urls") or []
-        if vt_link:
+        if vt_link and vt_link != "no-links":
             st.markdown(f"[Open VirusTotal report]({vt_link})")
         elif vt_urls:
             st.caption("Links checked: " + ", ".join(str(u) for u in vt_urls[:3]))
@@ -547,7 +593,7 @@ def render_alert_card(
                     st.session_state[show_key] = True
                     st.rerun()
 
-        a1, a2, _ = st.columns([2, 2, 4])
+        a1, a2, a3 = st.columns([2, 2, 2])
         with a1:
             if st.button(
                 "✅ Approve (Return to Inbox)",
@@ -599,6 +645,24 @@ def render_alert_card(
                 ):
                     st.session_state[confirm_key] = True
                     st.rerun()
+
+        with a3:
+            if st.button(
+                "🛡 Rescan VT",
+                key=f"vt_{uid}",
+                use_container_width=True,
+            ):
+                try:
+                    with st.spinner("Checking links on VirusTotal…"):
+                        updated = rescan_alert_virustotal(settings, client, alert)
+                    st.success(f"VirusTotal updated: {format_vt_score(updated)}")
+                    st.rerun()
+                except (ConfigurationError, GmailError, DatabaseError) as exc:
+                    logger.exception("VT rescan failed uid=%s", uid)
+                    st.error(str(exc))
+                except Exception as exc:
+                    logger.exception("Unexpected VT rescan failure uid=%s", uid)
+                    st.error(f"VirusTotal rescan failed: {exc}")
 
     st.write("")
 
