@@ -25,10 +25,6 @@ from logger import get_logger
 
 logger = get_logger(__name__)
 
-# CPython imaplib quotes mailbox specials but omits ASCII space. Gmail then
-# rejects `CREATE SOAR Review` with BAD "Could not parse command".
-imaplib._mustquote = re.compile(br'[\(\)\{ %*"\\\x00-\x1f\x7f-\xff]')
-
 
 class GmailError(Exception):
     """Raised when an IMAP / Gmail operation fails."""
@@ -139,10 +135,21 @@ class GmailClient:
                 logger.info("Folder already exists: %s", folder)
                 return
 
-            create_status, _ = conn.create(folder)
+            create_status, create_data = conn.create(_quote_mailbox(folder))
             if create_status != "OK":
-                # Race: another process may have created it
-                logger.warning("CREATE returned %s for folder=%s", create_status, folder)
+                detail = " ".join(
+                    d.decode("utf-8", errors="replace") if isinstance(d, bytes) else str(d)
+                    for d in (create_data or [])
+                )
+                if "ALREADYEXISTS" in detail.upper():
+                    logger.info("Folder already exists (CREATE race): %s", folder)
+                else:
+                    logger.warning(
+                        "CREATE returned %s for folder=%s data=%s",
+                        create_status,
+                        folder,
+                        create_data,
+                    )
             else:
                 logger.info("Created folder: %s", folder)
         except GmailError:
@@ -155,7 +162,7 @@ class GmailClient:
         """Select a mailbox and return the message count."""
         conn = self._require_conn()
         try:
-            status, data = conn.select(folder, readonly=readonly)
+            status, data = conn.select(_quote_mailbox(folder), readonly=readonly)
             if status != "OK":
                 raise GmailError(f"Could not select folder '{folder}': {status}")
             count = int(data[0]) if data and data[0] else 0
@@ -171,47 +178,74 @@ class GmailClient:
     # Fetch / parse
     # ------------------------------------------------------------------
 
-    def fetch_unseen(self) -> list[EmailMessage]:
-        """Fetch all UNSEEN messages from the currently selected folder."""
+    def fetch_unseen(self, limit: Optional[int] = None) -> list[EmailMessage]:
+        """Fetch UNSEEN messages without marking them as read.
+
+        Args:
+            limit: If set, only return the newest N unseen messages
+                (avoids downloading a huge backlog on large inboxes).
+        """
+        return self._fetch_by_search("UNSEEN", limit=limit)
+
+    def fetch_recent_seen(self, limit: int = 10) -> list[EmailMessage]:
+        """Fetch the most recent SEEN messages (diagnostic: already-read mail)."""
+        return self._fetch_by_search("SEEN", limit=limit)
+
+    def _fetch_by_search(
+        self,
+        criterion: str,
+        limit: Optional[int] = None,
+    ) -> list[EmailMessage]:
         conn = self._require_conn()
         try:
-            status, data = conn.uid("search", None, "UNSEEN")
+            status, data = conn.uid("search", None, criterion)
             if status != "OK":
-                raise GmailError(f"UID SEARCH UNSEEN failed: {status}")
+                raise GmailError(f"UID SEARCH {criterion} failed: {status}")
 
             uid_blob = data[0] if data else b""
             if not uid_blob:
-                logger.info("No unseen messages found")
+                logger.info("No messages matched SEARCH %s", criterion)
                 return []
 
             uids = uid_blob.decode("utf-8", errors="replace").split()
+            if limit is not None and limit > 0:
+                uids = uids[-limit:]
+
             messages: list[EmailMessage] = []
             for uid in uids:
                 parsed = self._fetch_uid(uid)
                 if parsed is not None:
                     messages.append(parsed)
 
-            logger.info("Fetched %d unseen messages", len(messages))
+            logger.info(
+                "Fetched %d messages for SEARCH %s (limit=%s)",
+                len(messages),
+                criterion,
+                limit,
+            )
             return messages
         except GmailError:
             raise
         except Exception as exc:
-            logger.exception("Failed to fetch unseen messages")
-            raise GmailError(f"Failed to fetch unread emails: {exc}") from exc
+            logger.exception("Failed SEARCH %s", criterion)
+            raise GmailError(f"Failed to fetch emails ({criterion}): {exc}") from exc
 
     def _fetch_uid(self, uid: str) -> Optional[EmailMessage]:
+        """Fetch a message by UID without setting \\Seen (BODY.PEEK)."""
         conn = self._require_conn()
-        status, data = conn.uid("fetch", uid, "(RFC822)")
+        # RFC822 sets \\Seen; BODY.PEEK[] leaves unread mail unread so a
+        # clean score does not silently remove the message from UNSEEN.
+        status, data = conn.uid("fetch", uid, "(BODY.PEEK[])")
         if status != "OK" or not data or data[0] is None:
             logger.warning("Could not fetch UID=%s status=%s", uid, status)
             return None
 
-        raw = data[0][1] if isinstance(data[0], tuple) else None
-        if not isinstance(raw, (bytes, bytearray)):
+        raw = _extract_fetch_bytes(data)
+        if raw is None:
             logger.warning("Unexpected FETCH payload for UID=%s", uid)
             return None
 
-        msg = email.message_from_bytes(bytes(raw))
+        msg = email.message_from_bytes(raw)
         return EmailMessage(
             gmail_uid=str(uid),
             message_id=_header_value(msg, "Message-ID") or f"uid-{uid}",
@@ -245,7 +279,7 @@ class GmailClient:
 
         # Prefer MOVE extension
         try:
-            status, _ = conn.uid("MOVE", uid, destination)
+            status, _ = conn.uid("MOVE", uid, _quote_mailbox(destination))
             if status == "OK":
                 logger.info(
                     "Moved UID=%s from %s to %s via MOVE",
@@ -271,7 +305,7 @@ class GmailClient:
         conn = self._require_conn()
         self.select_folder(source, readonly=False)
 
-        copy_status, _ = conn.uid("COPY", uid, destination)
+        copy_status, _ = conn.uid("COPY", uid, _quote_mailbox(destination))
         if copy_status != "OK":
             raise GmailError(
                 f"Failed to copy UID={uid} to '{destination}': {copy_status}. "
@@ -411,6 +445,33 @@ class GmailClient:
 # ---------------------------------------------------------------------------
 # Parsing helpers
 # ---------------------------------------------------------------------------
+
+
+def _quote_mailbox(name: str) -> str:
+    """Quote an IMAP mailbox name when required.
+
+    Modern CPython imaplib concatenates CREATE/SELECT args without quoting,
+    so names with spaces (e.g. ``SOAR Review``) must be quoted by callers.
+    """
+    if not name or name.upper() == "INBOX":
+        return name or "INBOX"
+    stripped = name.strip()
+    if len(stripped) >= 2 and stripped[0] == '"' and stripped[-1] == '"':
+        return stripped
+    escaped = stripped.replace("\\", "\\\\").replace('"', '\\"')
+    if re.search(r'[\s(){%*\\\"]', stripped):
+        return f'"{escaped}"'
+    return stripped
+
+
+def _extract_fetch_bytes(data: list) -> Optional[bytes]:
+    """Pull raw message bytes from an IMAP FETCH response payload."""
+    for item in data or []:
+        if isinstance(item, tuple) and len(item) >= 2:
+            payload = item[1]
+            if isinstance(payload, (bytes, bytearray)):
+                return bytes(payload)
+    return None
 
 
 def _mailbox_from_list_line(line: str) -> str:
