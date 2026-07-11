@@ -187,6 +187,67 @@ class GmailClient:
         """
         return self._fetch_by_search("UNSEEN", limit=limit)
 
+    def fetch_unseen_in_recent(
+        self,
+        lookback: int = 100,
+    ) -> tuple[list[EmailMessage], dict[str, int]]:
+        """Fetch UNSEEN messages among the newest ``lookback`` emails.
+
+        Uses sequence-number FETCH for only the recent window — never
+        ``SEARCH ALL`` / full-mailbox ``SEARCH UNSEEN``, which OOM on
+        large Gmail inboxes (50k+ messages).
+        """
+        conn = self._require_conn()
+        meta = {"recent_total": 0, "unseen_in_lookback": 0}
+        try:
+            exists = self._selected_message_count()
+            if exists <= 0:
+                return [], meta
+
+            start = max(1, exists - lookback + 1)
+            end = exists
+            seq_set = f"{start}:{end}"
+            status, data = conn.fetch(seq_set, "(UID FLAGS)")
+            if status != "OK" or not data:
+                raise GmailError(f"FETCH {seq_set} UID FLAGS failed: {status}")
+
+            unseen_uids = _uids_without_seen(data)
+            meta["recent_total"] = end - start + 1
+            meta["unseen_in_lookback"] = len(unseen_uids)
+
+            messages: list[EmailMessage] = []
+            for uid in unseen_uids:
+                parsed = self._fetch_uid(uid)
+                if parsed is not None:
+                    messages.append(parsed)
+
+            logger.info(
+                "Lookback=%d seq=%s recent=%d unseen_in_window=%d fetched=%d",
+                lookback,
+                seq_set,
+                meta["recent_total"],
+                meta["unseen_in_lookback"],
+                len(messages),
+            )
+            return messages, meta
+        except GmailError:
+            raise
+        except Exception as exc:
+            logger.exception("Failed fetch_unseen_in_recent lookback=%s", lookback)
+            raise GmailError(
+                f"Failed to fetch recent unread emails: {exc}"
+            ) from exc
+
+    def _selected_message_count(self) -> int:
+        """Return EXISTS count for the currently selected mailbox."""
+        conn = self._require_conn()
+        # imaplib stores the last EXISTS in untagged_responses after SELECT
+        raw = conn.untagged_responses.get("EXISTS", [b"0"])[-1]
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
+
     def fetch_recent_seen(self, limit: int = 10) -> list[EmailMessage]:
         """Fetch the most recent SEEN messages (diagnostic: already-read mail)."""
         return self._fetch_by_search("SEEN", limit=limit)
@@ -472,6 +533,33 @@ def _extract_fetch_bytes(data: list) -> Optional[bytes]:
             if isinstance(payload, (bytes, bytearray)):
                 return bytes(payload)
     return None
+
+
+def _uids_without_seen(fetch_data: list) -> list[str]:
+    """Parse ``FETCH (UID FLAGS)`` rows and return UIDs missing \\Seen.
+
+    Preserves ascending sequence order (oldest → newest within the window).
+    """
+    uids: list[str] = []
+    for item in fetch_data or []:
+        if item is None or item == b")":
+            continue
+        if isinstance(item, tuple):
+            header = item[0]
+        else:
+            header = item
+        if not isinstance(header, (bytes, bytearray)):
+            continue
+        line = header.decode("utf-8", errors="replace")
+        uid_match = re.search(r"\bUID\s+(\d+)\b", line, re.IGNORECASE)
+        if not uid_match:
+            continue
+        flags_match = re.search(r"FLAGS\s*\(([^)]*)\)", line, re.IGNORECASE)
+        flags = (flags_match.group(1) if flags_match else "").upper()
+        if "\\SEEN" in flags:
+            continue
+        uids.append(uid_match.group(1))
+    return uids
 
 
 def _mailbox_from_list_line(line: str) -> str:

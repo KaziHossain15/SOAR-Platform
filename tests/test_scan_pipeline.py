@@ -64,23 +64,25 @@ class TestScanInboxMocked(unittest.TestCase):
 
         gmail = MagicMock()
         mock_gmail_cls.return_value.__enter__.return_value = gmail
-        gmail._require_conn.return_value.uid.return_value = ("OK", [b"1 2"])
-        gmail.fetch_unseen.return_value = [
-            EmailMessage(
-                gmail_uid="1",
-                message_id="<a@b>",
-                sender="phish@evil.test",
-                subject="URGENT action",
-                body="Please respond",
-            ),
-            EmailMessage(
-                gmail_uid="2",
-                message_id="<c@d>",
-                sender="friend@example.com",
-                subject="Hello",
-                body="How are you?",
-            ),
-        ]
+        gmail.fetch_unseen_in_recent.return_value = (
+            [
+                EmailMessage(
+                    gmail_uid="1",
+                    message_id="<a@b>",
+                    sender="phish@evil.test",
+                    subject="URGENT action",
+                    body="Please respond",
+                ),
+                EmailMessage(
+                    gmail_uid="2",
+                    message_id="<c@d>",
+                    sender="friend@example.com",
+                    subject="Hello",
+                    body="How are you?",
+                ),
+            ],
+            {"recent_total": 100, "unseen_in_lookback": 2},
+        )
         gmail.move_message.return_value = "99"
 
         settings = Settings(
@@ -95,6 +97,8 @@ class TestScanInboxMocked(unittest.TestCase):
         self.assertEqual(stats["scanned"], 2)
         self.assertEqual(stats["quarantined"], 1)
         self.assertEqual(stats["clean"], 1)
+        self.assertEqual(stats["lookback"], 100)
+        gmail.fetch_unseen_in_recent.assert_called_once_with(lookback=100)
         gmail.move_message.assert_called_once()
         mock_insert.assert_called_once()
 
@@ -113,9 +117,10 @@ class TestScanInboxMocked(unittest.TestCase):
         ]
         gmail = MagicMock()
         mock_gmail_cls.return_value.__enter__.return_value = gmail
-        gmail.fetch_unseen.return_value = []
-        # Cheap UNSEEN count path
-        gmail._require_conn.return_value.uid.return_value = ("OK", [b""])
+        gmail.fetch_unseen_in_recent.return_value = (
+            [],
+            {"recent_total": 100, "unseen_in_lookback": 0},
+        )
 
         settings = Settings(
             supabase_url="https://example.supabase.co",
@@ -128,6 +133,54 @@ class TestScanInboxMocked(unittest.TestCase):
         self.assertEqual(stats["quarantined"], 0)
         self.assertEqual(stats["clean"], 0)
         gmail.move_message.assert_not_called()
+
+
+class TestFetchUnseenInRecent(unittest.TestCase):
+    def test_intersects_unseen_with_newest_lookback(self) -> None:
+        from gmail_client import GmailClient
+
+        client = GmailClient.__new__(GmailClient)
+        conn = MagicMock()
+        conn.untagged_responses = {"EXISTS": [b"10"]}
+        # FETCH seq UID FLAGS for messages 6:10
+        conn.fetch.return_value = (
+            "OK",
+            [
+                b"6 (UID 106 FLAGS (\\Seen))",
+                b"7 (UID 107 FLAGS ())",
+                b"8 (UID 108 FLAGS (\\Recent))",
+                b"9 (UID 109 FLAGS (\\Seen \\Recent))",
+                b"10 (UID 110 FLAGS ())",
+            ],
+        )
+        client._conn = conn
+        client._fetch_uid = MagicMock(  # type: ignore[method-assign]
+            side_effect=lambda uid: EmailMessage(
+                gmail_uid=uid,
+                message_id=f"<{uid}>",
+                sender="a@b",
+                subject=f"s{uid}",
+                body="",
+            )
+        )
+
+        messages, meta = client.fetch_unseen_in_recent(lookback=5)
+        self.assertEqual(meta["recent_total"], 5)
+        self.assertEqual([m.gmail_uid for m in messages], ["107", "108", "110"])
+        self.assertEqual(meta["unseen_in_lookback"], 3)
+        conn.fetch.assert_called_once_with("6:10", "(UID FLAGS)")
+
+
+class TestUidsWithoutSeen(unittest.TestCase):
+    def test_parses_flags(self) -> None:
+        from gmail_client import _uids_without_seen
+
+        data = [
+            b"1 (UID 10 FLAGS (\\Seen))",
+            b"2 (UID 11 FLAGS ())",
+            (b"3 (UID 12 FLAGS (\\Recent))", b""),
+        ]
+        self.assertEqual(_uids_without_seen(data), ["11", "12"])
 
 
 if __name__ == "__main__":

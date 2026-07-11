@@ -45,9 +45,8 @@ logger = get_logger(__name__)
 # Quarantine when score meets this threshold
 QUARANTINE_THRESHOLD = 1
 
-# Large inboxes can have tens of thousands of UNSEEN messages. Only process
-# the newest N per Scan click so the UI does not hang / OOM.
-SCAN_UNSEEN_LIMIT = 50
+# Only consider unread mail among the newest N messages in INBOX.
+SCAN_LOOKBACK = 100
 
 PAGE_TITLE = "SOAR Email Triage"
 PAGE_ICON = "🛡️"
@@ -180,46 +179,40 @@ def scan_inbox(settings: Settings, client: Client) -> dict[str, int]:
     """Scan UNSEEN mail, score with fresh rules, quarantine suspicious mail.
 
     Rules are always reloaded from Supabase — never cached between scans.
-    Only the newest ``SCAN_UNSEEN_LIMIT`` unread messages are processed per run
-    (large Gmail backlogs otherwise hang the app).
+    Only unread messages among the newest ``SCAN_LOOKBACK`` inbox emails
+    are considered (older backlog is ignored).
     """
     stats = {
         "scanned": 0,
         "quarantined": 0,
         "skipped_dup": 0,
         "clean": 0,
-        "unseen_total": 0,
-        "unseen_capped": 0,
+        "lookback": SCAN_LOOKBACK,
+        "recent_total": 0,
+        "unseen_in_lookback": 0,
     }
 
     rules = fetch_keyword_rules(client, enabled_only=True)
-    logger.info("Scan starting with %d enabled rules", len(rules))
+    logger.info(
+        "Scan starting with %d enabled rules (lookback=%d)",
+        len(rules),
+        SCAN_LOOKBACK,
+    )
 
     with GmailClient(settings) as gmail:
         gmail.ensure_folder(SOAR_REVIEW_FOLDER)
         gmail.select_folder("INBOX", readonly=False)
 
-        conn = gmail._require_conn()
-        status, data = conn.uid("search", None, "UNSEEN")
-        all_uids: list[str] = []
-        if status == "OK" and data and data[0]:
-            all_uids = data[0].decode("utf-8", errors="replace").split()
-        stats["unseen_total"] = len(all_uids)
-
-        if len(all_uids) > SCAN_UNSEEN_LIMIT:
-            stats["unseen_capped"] = 1
-            logger.warning(
-                "INBOX has %d UNSEEN messages; scanning newest %d only",
-                len(all_uids),
-                SCAN_UNSEEN_LIMIT,
-            )
-
-        messages = gmail.fetch_unseen(limit=SCAN_UNSEEN_LIMIT)
+        messages, meta = gmail.fetch_unseen_in_recent(lookback=SCAN_LOOKBACK)
+        stats["recent_total"] = meta.get("recent_total", 0)
+        stats["unseen_in_lookback"] = meta.get("unseen_in_lookback", 0)
         stats["scanned"] = len(messages)
 
         if not messages:
             logger.info(
-                "No UNSEEN messages in INBOX — already-read mail is never scanned"
+                "No UNSEEN messages in the newest %d emails — "
+                "older or already-read mail is not scanned",
+                SCAN_LOOKBACK,
             )
 
         for msg in messages:
@@ -587,9 +580,9 @@ def main() -> None:
         )
     with info_col:
         st.caption(
-            f"Unread mail is scored with live Supabase rules. "
-            f"Suspicious messages (score ≥ {QUARANTINE_THRESHOLD}) move to "
-            f"**{SOAR_REVIEW_FOLDER}**."
+            f"Unread mail among the newest {SCAN_LOOKBACK} inbox messages is "
+            f"scored with live Supabase rules. Suspicious messages "
+            f"(score ≥ {QUARANTINE_THRESHOLD}) move to **{SOAR_REVIEW_FOLDER}**."
         )
 
     if scan_clicked:
@@ -597,23 +590,13 @@ def main() -> None:
             with st.spinner("Scanning inbox and applying detection rules…"):
                 stats = scan_inbox(settings, client)
             st.success(
-                f"Scan complete — scanned {stats['scanned']}"
-                + (
-                    f" of {stats['unseen_total']} unread"
-                    if stats.get("unseen_total", 0) > stats["scanned"]
-                    else ""
-                )
-                + f", quarantined {stats['quarantined']}, "
+                f"Scan complete — looked at newest {stats.get('lookback', SCAN_LOOKBACK)} "
+                f"emails ({stats.get('unseen_in_lookback', stats['scanned'])} unread), "
+                f"scanned {stats['scanned']}, "
+                f"quarantined {stats['quarantined']}, "
                 f"clean {stats['clean']}, "
                 f"duplicates skipped {stats['skipped_dup']}."
             )
-            if stats.get("unseen_capped"):
-                st.warning(
-                    f"Your inbox has {stats['unseen_total']:,} unread messages. "
-                    f"Only the newest {SCAN_UNSEEN_LIMIT} were scanned this run "
-                    "(to avoid hanging). Click Scan again to continue, or mark "
-                    "old mail as read in Gmail to shrink the backlog."
-                )
         except ConfigurationError as exc:
             st.error(str(exc))
         except GmailError as exc:
