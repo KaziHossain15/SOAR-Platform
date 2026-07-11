@@ -25,6 +25,10 @@ from logger import get_logger
 
 logger = get_logger(__name__)
 
+# CPython imaplib quotes mailbox specials but omits ASCII space. Gmail then
+# rejects `CREATE SOAR Review` with BAD "Could not parse command".
+imaplib._mustquote = re.compile(br'[\(\)\{ %*"\\\x00-\x1f\x7f-\xff]')
+
 
 class GmailError(Exception):
     """Raised when an IMAP / Gmail operation fails."""
@@ -127,9 +131,9 @@ class GmailClient:
                 if not raw:
                     continue
                 line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
-                # IMAP LIST ends with the mailbox name (possibly quoted)
-                name = line.rsplit(" ", 1)[-1].strip().strip('"')
-                existing.add(name)
+                name = _mailbox_from_list_line(line)
+                if name:
+                    existing.add(name)
 
             if folder in existing:
                 logger.info("Folder already exists: %s", folder)
@@ -407,6 +411,29 @@ class GmailClient:
 # ---------------------------------------------------------------------------
 # Parsing helpers
 # ---------------------------------------------------------------------------
+
+
+def _mailbox_from_list_line(line: str) -> str:
+    """Extract the mailbox name from an IMAP LIST response line.
+
+    Formats look like: ``(\\HasNoChildren) "/" "SOAR Review"`` or
+    ``(\\HasNoChildren) "/" INBOX``. A naive ``rsplit`` breaks on spaces
+    inside quoted names.
+    """
+    line = line.strip()
+    if not line:
+        return ""
+
+    # Prefer a trailing quoted mailbox (handles spaces).
+    if line.endswith('"'):
+        i = len(line) - 2
+        while i >= 0:
+            if line[i] == '"' and (i == 0 or line[i - 1] != "\\"):
+                raw = line[i + 1 : -1]
+                return raw.replace('\\"', '"').replace("\\\\", "\\")
+            i -= 1
+
+    return line.rsplit(" ", 1)[-1].strip().strip('"')
 
 
 def _header_value(msg: Message, name: str) -> str:
