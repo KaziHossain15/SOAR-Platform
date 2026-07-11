@@ -38,6 +38,14 @@ from database import (
 from gmail_client import GmailClient, GmailError
 from logger import get_logger, setup_logging
 from triage import is_suspicious, score_email
+from virustotal import (
+    MAX_URLS_PER_SCAN,
+    VirusTotalClient,
+    VirusTotalScanResult,
+    extract_urls,
+    format_vt_score,
+    url_id,
+)
 
 setup_logging()
 logger = get_logger(__name__)
@@ -192,14 +200,45 @@ def scan_inbox(settings: Settings, client: Client) -> dict[str, int]:
                 SCAN_LOOKBACK,
             )
 
+        vt_client = VirusTotalClient(settings.virustotal_api_key)
+        if vt_client.enabled:
+            logger.info("VirusTotal link scanning enabled for this scan")
+        else:
+            logger.info("VirusTotal disabled (set VIRUSTOTAL_API_KEY to enable)")
+
+        vt_budget = MAX_URLS_PER_SCAN
+
         for msg in messages:
             result = score_email(msg.subject, msg.body, rules)
-            if not is_suspicious(result, QUARANTINE_THRESHOLD):
+            keyword_hit = is_suspicious(result, QUARANTINE_THRESHOLD)
+            urls = extract_urls(msg.subject, msg.body)
+            vt_result = VirusTotalScanResult(enabled=vt_client.enabled)
+
+            if vt_client.enabled and vt_budget > 0:
+                if keyword_hit:
+                    vt_result = vt_client.scan_email_urls(
+                        msg.subject,
+                        msg.body,
+                        scan_budget_remaining=vt_budget,
+                    )
+                    vt_budget = max(0, vt_budget - len(vt_result.urls_checked))
+                elif urls:
+                    # Link-only malware catch using remaining budget (1 URL).
+                    vt_result = vt_client.scan_email_urls(
+                        msg.subject,
+                        msg.body,
+                        scan_budget_remaining=min(1, vt_budget),
+                    )
+                    vt_budget = max(0, vt_budget - len(vt_result.urls_checked))
+
+            vt_hit = vt_result.is_malicious
+            if not keyword_hit and not vt_hit:
                 stats["clean"] += 1
                 logger.info(
-                    "Clean uid=%s score=%s subject=%r matches=%s",
+                    "Clean uid=%s score=%s vt=%s subject=%r matches=%s",
                     msg.gmail_uid,
                     result.threat_score,
+                    vt_result.vt_score,
                     (msg.subject or "")[:80],
                     result.matched_keywords,
                 )
@@ -215,6 +254,14 @@ def scan_inbox(settings: Settings, client: Client) -> dict[str, int]:
             # Re-select INBOX for subsequent unseen processing
             gmail.select_folder("INBOX", readonly=False)
 
+            permalink = ""
+            if vt_result.results:
+                permalink = vt_result.results[0].permalink
+            elif vt_result.worst_url:
+                permalink = (
+                    f"https://www.virustotal.com/gui/url/{url_id(vt_result.worst_url)}"
+                )
+
             inserted = insert_alert(
                 client,
                 gmail_uid=dest_uid,
@@ -223,6 +270,12 @@ def scan_inbox(settings: Settings, client: Client) -> dict[str, int]:
                 subject=msg.subject,
                 threat_score=result.threat_score,
                 matched_keywords=result.matched_keywords,
+                vt_score=vt_result.vt_score,
+                vt_malicious=vt_result.malicious,
+                vt_suspicious=vt_result.suspicious,
+                vt_total=vt_result.total_engines,
+                vt_urls=vt_result.urls_checked or urls[:2],
+                vt_link=permalink or None,
             )
             if inserted is None:
                 stats["skipped_dup"] += 1
@@ -234,9 +287,10 @@ def scan_inbox(settings: Settings, client: Client) -> dict[str, int]:
             else:
                 stats["quarantined"] += 1
                 logger.info(
-                    "Quarantined uid=%s score=%s keywords=%s subject=%r",
+                    "Quarantined uid=%s score=%s vt=%s keywords=%s subject=%r",
                     dest_uid,
                     result.threat_score,
+                    vt_result.vt_score,
                     result.matched_keywords,
                     (msg.subject or "")[:80],
                 )
@@ -464,9 +518,19 @@ def render_alert_card(
     with st.container(border=True):
         st.markdown(f"{score_emoji(score)} **{subject}**")
         st.write(f"**From:** {sender}")
+        vt_label = format_vt_score(alert)
         st.write(
-            f"**Threat score:** {score}  ·  **Status:** {alert.get('status') or 'PENDING'}"
+            f"**Threat score:** {score}  ·  **VirusTotal:** {vt_label}  ·  "
+            f"**Status:** {alert.get('status') or 'PENDING'}"
         )
+        vt_link = alert.get("vt_link") or ""
+        vt_urls = alert.get("vt_urls") or []
+        if vt_link:
+            st.markdown(f"[Open VirusTotal report]({vt_link})")
+        elif vt_urls:
+            st.caption("Links checked: " + ", ".join(str(u) for u in vt_urls[:3]))
+        if not settings.virustotal_api_key:
+            st.caption("Set VIRUSTOTAL_API_KEY in `.env` to enable link scanning.")
         st.caption(f"Created: {format_timestamp(alert.get('created_at'))}")
         if keywords:
             st.write("**Matched keywords:** " + ", ".join(str(k) for k in keywords))
@@ -562,8 +626,14 @@ def main() -> None:
     with info_col:
         st.caption(
             f"Unread mail among the newest {SCAN_LOOKBACK} inbox messages is "
-            f"scored with live Supabase rules. Suspicious messages "
-            f"(score ≥ {QUARANTINE_THRESHOLD}) move to **{SOAR_REVIEW_FOLDER}**."
+            f"scored with live Supabase rules"
+            + (
+                " and VirusTotal link checks"
+                if settings.virustotal_api_key
+                else ""
+            )
+            + f". Suspicious messages (score ≥ {QUARANTINE_THRESHOLD} or "
+            f"VT malicious links) move to **{SOAR_REVIEW_FOLDER}**."
         )
 
     if scan_clicked:

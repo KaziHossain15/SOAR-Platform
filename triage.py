@@ -107,13 +107,40 @@ def analyze_with_openai(subject: str, body: str) -> Optional[TriageResult]:
 
 
 def check_virustotal(urls: list[str], hashes: list[str]) -> Optional[TriageResult]:
-    """TODO: Query VirusTotal for URL / file reputation.
+    """Query VirusTotal for URL reputation (hashes reserved for future use).
 
-    Should return a TriageResult or None if the integration is disabled.
+    Returns a TriageResult whose threat_score is the worst malicious engine
+    count across URLs, or None when no API key / no URLs.
     """
-    # TODO: Implement VirusTotal lookup
-    _ = (urls, hashes)
-    return None
+    from config import load_settings
+    from virustotal import VirusTotalClient
+
+    _ = hashes
+    try:
+        api_key = load_settings().virustotal_api_key
+    except Exception:
+        api_key = ""
+    client = VirusTotalClient(api_key)
+    if not client.enabled or not urls:
+        return None
+
+    # Reuse email scanner by joining URLs into a synthetic body.
+    result = client.scan_email_urls("", "\n".join(urls))
+    if not result.urls_checked:
+        return None
+    return TriageResult(
+        threat_score=result.vt_score,
+        matched_keywords=[f"vt:{u}" for u in result.urls_checked[:3]],
+        details={
+            "virustotal": {
+                "malicious": result.malicious,
+                "suspicious": result.suspicious,
+                "total": result.total_engines,
+                "urls": result.urls_checked,
+                "worst_url": result.worst_url,
+            }
+        },
+    )
 
 
 def check_abuseipdb(ip_addresses: list[str]) -> Optional[TriageResult]:

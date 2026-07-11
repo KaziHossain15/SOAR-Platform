@@ -58,6 +58,7 @@ class Settings:
     supabase_key: str
     gmail_user: str
     gmail_app_password: str
+    virustotal_api_key: str = ""
 
 
 def _read_secret(key: str) -> Optional[str]:
@@ -104,15 +105,18 @@ def load_settings() -> Settings:
         logger.error("Configuration incomplete: missing %s", joined)
         raise ConfigurationError(message)
 
+    vt_key = _read_secret("VIRUSTOTAL_API_KEY") or ""
     settings = Settings(
         supabase_url=_read_secret("SUPABASE_URL") or "",
         supabase_key=_read_secret("SUPABASE_KEY") or "",
         gmail_user=_read_secret("GMAIL_USER") or "",
         gmail_app_password=_read_secret("GMAIL_APP_PASSWORD") or "",
+        virustotal_api_key=vt_key,
     )
     logger.info(
-        "Configuration loaded for Gmail user=%s supabase_host=%s",
+        "Configuration loaded for Gmail user=%s supabase_host=%s virustotal=%s",
         settings.gmail_user,
         settings.supabase_url.split("//")[-1].split("/")[0] if settings.supabase_url else "unknown",
+        "configured" if settings.virustotal_api_key else "disabled",
     )
     return settings

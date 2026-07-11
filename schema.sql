@@ -28,6 +28,12 @@ CREATE TABLE IF NOT EXISTS public.alerts (
     subject TEXT,
     threat_score INTEGER NOT NULL DEFAULT 0,
     matched_keywords TEXT[] NOT NULL DEFAULT '{}',
+    vt_score INTEGER NOT NULL DEFAULT 0,
+    vt_malicious INTEGER NOT NULL DEFAULT 0,
+    vt_suspicious INTEGER NOT NULL DEFAULT 0,
+    vt_total INTEGER NOT NULL DEFAULT 0,
+    vt_urls TEXT[] NOT NULL DEFAULT '{}',
+    vt_link TEXT,
     status TEXT NOT NULL DEFAULT 'PENDING'
         CHECK (status IN ('PENDING', 'APPROVED', 'DELETED')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

@@ -178,6 +178,12 @@ def insert_alert(
     threat_score: int,
     matched_keywords: list[str],
     status: str = STATUS_PENDING,
+    vt_score: int = 0,
+    vt_malicious: int = 0,
+    vt_suspicious: int = 0,
+    vt_total: int = 0,
+    vt_urls: Optional[list[str]] = None,
+    vt_link: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     """Insert a new alert, skipping silently if the UID already exists.
 
@@ -196,6 +202,12 @@ def insert_alert(
         "subject": subject,
         "threat_score": threat_score,
         "matched_keywords": matched_keywords,
+        "vt_score": int(vt_score or 0),
+        "vt_malicious": int(vt_malicious or 0),
+        "vt_suspicious": int(vt_suspicious or 0),
+        "vt_total": int(vt_total or 0),
+        "vt_urls": list(vt_urls or []),
+        "vt_link": vt_link,
         "status": status,
         "created_at": now,
         "updated_at": now,
@@ -204,9 +216,10 @@ def insert_alert(
         response = client.table(TABLE_ALERTS).insert(payload).execute()
         row = (response.data or [None])[0]
         logger.info(
-            "Inserted alert gmail_uid=%s score=%s status=%s",
+            "Inserted alert gmail_uid=%s score=%s vt=%s status=%s",
             gmail_uid,
             threat_score,
+            vt_score,
             status,
         )
         return row
