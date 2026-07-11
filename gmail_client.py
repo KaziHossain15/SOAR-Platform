@@ -319,6 +319,21 @@ class GmailClient:
     # Move / delete
     # ------------------------------------------------------------------
 
+    def fetch_message(
+        self,
+        uid: str,
+        folder: str = SOAR_REVIEW_FOLDER,
+        message_id: Optional[str] = None,
+    ) -> Optional[EmailMessage]:
+        """Fetch a single message from ``folder`` by UID (Message-ID fallback)."""
+        resolved = str(uid)
+        if message_id:
+            found = self.find_uid_by_message_id(message_id, folder)
+            if found:
+                resolved = found
+        self.select_folder(folder, readonly=True)
+        return self._fetch_uid(resolved)
+
     def move_message(
         self,
         uid: str,
