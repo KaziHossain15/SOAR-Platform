@@ -399,6 +399,23 @@ def purge_resolved_alerts(
         raise DatabaseError(f"Failed to purge resolved alerts: {exc}") from exc
 
 
+def purge_pending_alerts(client: Client) -> int:
+    """Hard-delete all PENDING alert rows from Supabase (DB only; Gmail unchanged)."""
+    try:
+        response = (
+            client.table(TABLE_ALERTS)
+            .delete()
+            .eq("status", STATUS_PENDING)
+            .execute()
+        )
+        deleted = len(response.data or [])
+        logger.info("Purged %d PENDING alerts (DB only)", deleted)
+        return deleted
+    except Exception as exc:
+        logger.exception("Failed to purge pending alerts")
+        raise DatabaseError(f"Failed to purge pending alerts: {exc}") from exc
+
+
 def fetch_stale_pending_alerts(
     client: Client,
     *,

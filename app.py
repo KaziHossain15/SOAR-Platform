@@ -37,6 +37,7 @@ from database import (
     get_client,
     insert_alert,
     insert_keyword_rule,
+    purge_pending_alerts,
     purge_resolved_alerts,
     purge_stale_pending_alerts,
     update_alert_status,
@@ -614,6 +615,29 @@ def render_cleanup_sidebar(settings: Settings, client: Client) -> None:
         f"**Deleted:** {counts.get(STATUS_DELETED, 0)}"
     )
     st.sidebar.caption(f"Total alert rows: {counts.get('total', 0)}")
+
+    pending_count = int(counts.get(STATUS_PENDING, 0) or 0)
+    st.sidebar.caption(
+        "Clear pending removes **PENDING** rows from Supabase only. "
+        "Mail in SOAR Review is left alone."
+    )
+    confirm_clear = st.sidebar.checkbox(
+        "Confirm clear all pending alerts",
+        value=False,
+        key="confirm_clear_pending",
+    )
+    if st.sidebar.button(
+        "Clear pending alerts",
+        use_container_width=True,
+        disabled=not confirm_clear or pending_count == 0,
+        key="clear_pending_btn",
+    ):
+        try:
+            deleted = purge_pending_alerts(client)
+            st.sidebar.success(f"Removed {deleted} pending alert(s) from Supabase.")
+            st.rerun()
+        except DatabaseError as exc:
+            st.sidebar.error(str(exc))
 
     with st.sidebar.expander("🧹 Clean up alert logs", expanded=False):
         older_days = st.number_input(

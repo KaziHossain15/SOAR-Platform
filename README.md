@@ -148,7 +148,17 @@ streamlit run app.py
 5. **Rescan VT** — re-extract links and refresh VirusTotal results for that alert.
 6. **Approve** — return the message to Inbox and mark the alert `APPROVED`.
 7. **Delete** — permanently remove from `SOAR Review` and mark `DELETED`.
-8. **Database Cleanup (sidebar)** — view alert counts; purge `APPROVED` / `DELETED` rows; optionally clear VirusTotal URL payloads on resolved alerts; manually expire stale pending alerts.
+8. **Database Cleanup (sidebar)** — view alert counts; purge `APPROVED` / `DELETED` rows; optionally clear VirusTotal URL payloads on resolved alerts; manually expire stale pending alerts; **Clear pending alerts** (see below).
+
+### Clear pending alerts
+
+Use **Clear pending alerts** (sidebar → Database Cleanup) when the Gmail side is already gone but Supabase still shows pending cards — for example you moved or deleted mail from **`SOAR Review` in Gmail** instead of using Approve / Delete in the UI.
+
+- Removes all **`PENDING`** rows from Supabase so they disappear from the dashboard.
+- Does **not** change Gmail (no move to Inbox, no delete).
+- Requires the confirmation checkbox before the button runs.
+
+Do **not** use this as a substitute for Approve/Delete when you still want the app to handle the message in Gmail.
 
 ### Pending alert retention
 
