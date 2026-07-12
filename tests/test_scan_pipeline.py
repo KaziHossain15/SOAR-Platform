@@ -81,7 +81,7 @@ class TestScanInboxMocked(unittest.TestCase):
                     body="How are you?",
                 ),
             ],
-            {"recent_total": 100, "unseen_in_lookback": 2},
+            {"recent_total": 50, "unseen_in_lookback": 2},
         )
         gmail.move_message.return_value = "99"
 
@@ -97,8 +97,8 @@ class TestScanInboxMocked(unittest.TestCase):
         self.assertEqual(stats["scanned"], 2)
         self.assertEqual(stats["quarantined"], 1)
         self.assertEqual(stats["clean"], 1)
-        self.assertEqual(stats["lookback"], 100)
-        gmail.fetch_unseen_in_recent.assert_called_once_with(lookback=100)
+        self.assertEqual(stats["lookback"], 50)
+        gmail.fetch_unseen_in_recent.assert_called_once_with(lookback=50)
         gmail.move_message.assert_called_once()
         mock_insert.assert_called_once()
 
@@ -119,7 +119,7 @@ class TestScanInboxMocked(unittest.TestCase):
         mock_gmail_cls.return_value.__enter__.return_value = gmail
         gmail.fetch_unseen_in_recent.return_value = (
             [],
-            {"recent_total": 100, "unseen_in_lookback": 0},
+            {"recent_total": 50, "unseen_in_lookback": 0},
         )
 
         settings = Settings(

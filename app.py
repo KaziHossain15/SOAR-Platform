@@ -62,7 +62,7 @@ logger = get_logger(__name__)
 QUARANTINE_THRESHOLD = 1
 
 # Only consider unread mail among the newest N messages in INBOX.
-SCAN_LOOKBACK = 100
+SCAN_LOOKBACK = 50
 
 # Auto-expire PENDING alerts (and try to remove from SOAR Review) after this many days.
 PENDING_RETENTION_DAYS = 7

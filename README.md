@@ -7,7 +7,7 @@ Local **Security Orchestration, Automation, and Response** for Gmail: scan unrea
 ## What it does
 
 1. Connects to Gmail over IMAP (App Password).
-2. Looks at unread messages among the **newest 100** inbox emails.
+2. Looks at unread messages among the **newest 50** inbox emails.
 3. Scores each message with keyword rules stored in **Supabase**.
 4. Optionally extracts links (including HTML `href`/`src`) and queries **VirusTotal**.
 5. Moves suspicious mail to a Gmail label/folder named **`SOAR Review`**.
@@ -38,7 +38,7 @@ Gmail INBOX ──scan──► Keyword triage (+ VirusTotal)
 | **Detection rules** | Add, edit, enable/disable, and delete keywords (weight 1–10) in the sidebar — no code changes. |
 | **Threat score** | Sum of matched rule weights; quarantine when score ≥ 1 (or VirusTotal reports malicious links). |
 | **VirusTotal** | Optional API key; shows malicious engine count next to threat score; **Rescan VT** per alert. |
-| **Lookback** | Only the newest 100 inbox messages are considered (avoids huge unread backlogs). |
+| **Lookback** | Only the newest 50 inbox messages are considered (avoids huge unread backlogs). |
 | **Quarantine** | IMAP move to `SOAR Review`; UIDs tracked per folder. |
 | **Pending retention** | Pending alerts older than **7 days** are auto-expired: mail returns to Inbox, Supabase row is deleted. |
 | **Database cleanup** | Sidebar tools to purge resolved alerts and free Supabase storage on the free tier. |
@@ -142,7 +142,7 @@ streamlit run app.py
 ## Using the dashboard
 
 1. **Detection Rules (sidebar)** — review or tune keywords before scanning.
-2. **Scan Inbox** — scores unread mail in the newest 100 messages; quarantines hits to `SOAR Review`.
+2. **Scan Inbox** — scores unread mail in the newest 50 messages; quarantines hits to `SOAR Review`.
 3. **Pending Alerts** — each card shows sender, subject, threat score, VirusTotal score, and matched keywords.
 4. **View email body** — load the quarantined message on demand.
 5. **Rescan VT** — re-extract links and refresh VirusTotal results for that alert.
@@ -201,7 +201,7 @@ python diagnose_inbox.py
 | Config / missing env errors | Incomplete `.env` | Fill all required vars; recreate containers so Compose reloads `.env` |
 | IMAP auth failed | Wrong app password / IMAP off | Create a new App Password; enable IMAP in Gmail settings |
 | Folder create / BAD parse | Older bug with spaces in `SOAR Review` | Use latest `main`; folder name must be quoted for IMAP |
-| Scan finds nothing | Mail already read, or outside newest 100 | Mark test mail **unread**; keep it recent in Inbox |
+| Scan finds nothing | Mail already read, or outside newest 50 | Mark test mail **unread**; keep it recent in Inbox |
 | White / blank UI | Theme + old HTML cards (fixed) | Refresh after latest image rebuild |
 | VirusTotal always `n/a` | Key missing, alert predates VT, or no links | Set key, restart Docker, click **Rescan VT**; confirm body/HTML has links |
 | DB insert errors on `vt_*` | Schema not migrated | Run `migrate_vt.sql` in Supabase |

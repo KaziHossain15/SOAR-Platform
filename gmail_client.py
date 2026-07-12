@@ -191,7 +191,7 @@ class GmailClient:
 
     def fetch_unseen_in_recent(
         self,
-        lookback: int = 100,
+        lookback: int = 50,
     ) -> tuple[list[EmailMessage], dict[str, int]]:
         """Fetch UNSEEN messages among the newest ``lookback`` emails.
 
