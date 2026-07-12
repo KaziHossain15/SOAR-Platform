@@ -18,6 +18,7 @@ from config import (
     SOAR_REVIEW_FOLDER,
     STATUS_APPROVED,
     STATUS_DELETED,
+    STATUS_PENDING,
     WEIGHT_MAX,
     WEIGHT_MIN,
     ConfigurationError,
@@ -26,12 +27,18 @@ from config import (
 )
 from database import (
     DatabaseError,
+    clear_vt_fields_on_resolved,
+    count_alerts_by_status,
+    delete_alert_row,
     delete_keyword_rule,
     fetch_keyword_rules,
     fetch_pending_alerts,
+    fetch_stale_pending_alerts,
     get_client,
     insert_alert,
     insert_keyword_rule,
+    purge_resolved_alerts,
+    purge_stale_pending_alerts,
     update_alert_status,
     update_alert_vt,
     update_keyword_rule,
@@ -56,6 +63,9 @@ QUARANTINE_THRESHOLD = 1
 
 # Only consider unread mail among the newest N messages in INBOX.
 SCAN_LOOKBACK = 100
+
+# Auto-expire PENDING alerts (and try to remove from SOAR Review) after this many days.
+PENDING_RETENTION_DAYS = 7
 
 PAGE_TITLE = "SOAR Email Triage"
 PAGE_ICON = "🛡️"
@@ -161,6 +171,68 @@ def load_alert_email_body(settings: Settings, alert: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
+def expire_stale_pending_alerts(
+    settings: Settings,
+    client: Client,
+    *,
+    older_than_days: int = PENDING_RETENTION_DAYS,
+) -> dict[str, int]:
+    """Expire PENDING alerts older than the retention window.
+
+    Moves the quarantined message from SOAR Review back to Inbox, then
+    hard-deletes the Supabase row. Gmail failures still remove the DB row
+    so the free-tier database does not keep growing.
+    """
+    stats = {"expired": 0, "gmail_restored": 0, "gmail_failed": 0}
+    stale = fetch_stale_pending_alerts(client, older_than_days=older_than_days)
+    if not stale:
+        return stats
+
+    logger.info(
+        "Expiring %d PENDING alerts older than %d days (restore to Inbox)",
+        len(stale),
+        older_than_days,
+    )
+
+    with GmailClient(settings) as gmail:
+        for alert in stale:
+            uid = str(alert.get("gmail_uid") or "")
+            message_id = alert.get("message_id") or ""
+            if not uid:
+                continue
+            try:
+                gmail.return_to_inbox(
+                    uid,
+                    folder=SOAR_REVIEW_FOLDER,
+                    message_id=message_id or None,
+                )
+                stats["gmail_restored"] += 1
+            except Exception as exc:
+                stats["gmail_failed"] += 1
+                logger.warning(
+                    "Could not restore expired quarantine mail uid=%s: %s",
+                    uid,
+                    exc,
+                )
+            try:
+                delete_alert_row(client, uid)
+                stats["expired"] += 1
+            except DatabaseError as exc:
+                logger.warning(
+                    "Could not delete expired alert row uid=%s: %s",
+                    uid,
+                    exc,
+                )
+
+    logger.info(
+        "Pending expiry complete expired=%s gmail_restored=%s gmail_failed=%s",
+        stats["expired"],
+        stats["gmail_restored"],
+        stats["gmail_failed"],
+    )
+    return stats
+
+
 def scan_inbox(settings: Settings, client: Client) -> dict[str, int]:
     """Scan UNSEEN mail, score with fresh rules, quarantine suspicious mail.
 
@@ -176,7 +248,18 @@ def scan_inbox(settings: Settings, client: Client) -> dict[str, int]:
         "lookback": SCAN_LOOKBACK,
         "recent_total": 0,
         "unseen_in_lookback": 0,
+        "expired_pending": 0,
     }
+
+    try:
+        expiry = expire_stale_pending_alerts(
+            settings,
+            client,
+            older_than_days=PENDING_RETENTION_DAYS,
+        )
+        stats["expired_pending"] = expiry.get("expired", 0)
+    except DatabaseError as exc:
+        logger.warning("Pending alert expiry skipped: %s", exc)
 
     rules = fetch_keyword_rules(client, enabled_only=True)
     logger.info(
@@ -371,7 +454,7 @@ def delete_alert(settings: Settings, client: Client, alert: dict[str, Any]) -> N
 # ---------------------------------------------------------------------------
 
 
-def render_detection_rules_sidebar(client: Client) -> None:
+def render_detection_rules_sidebar(settings: Settings, client: Client) -> None:
     st.sidebar.header("Detection Rules")
     st.sidebar.caption("Manage keyword rules without code changes.")
 
@@ -501,6 +584,110 @@ def render_detection_rules_sidebar(client: Client) -> None:
                         st.rerun()
                     except DatabaseError as exc:
                         st.error(str(exc))
+
+    render_cleanup_sidebar(settings, client)
+
+
+def render_cleanup_sidebar(settings: Settings, client: Client) -> None:
+    """Sidebar tools to reclaim Supabase space from alert history."""
+    st.sidebar.divider()
+    st.sidebar.header("Database Cleanup")
+    st.sidebar.caption(
+        "App logs go to Docker stdout (not Supabase). "
+        "This cleans **alert history** — the main thing that fills the free-tier DB."
+    )
+    st.sidebar.info(
+        f"Pending alerts auto-expire after **{PENDING_RETENTION_DAYS} days**: "
+        "mail is moved back to Inbox and the DB row is removed "
+        "(on each Scan Inbox, and once per browser session)."
+    )
+
+    try:
+        counts = count_alerts_by_status(client)
+    except DatabaseError as exc:
+        st.sidebar.error(str(exc))
+        return
+
+    st.sidebar.write(
+        f"**Pending:** {counts.get(STATUS_PENDING, 0)}  ·  "
+        f"**Approved:** {counts.get(STATUS_APPROVED, 0)}  ·  "
+        f"**Deleted:** {counts.get(STATUS_DELETED, 0)}"
+    )
+    st.sidebar.caption(f"Total alert rows: {counts.get('total', 0)}")
+
+    with st.sidebar.expander("🧹 Clean up alert logs", expanded=False):
+        older_days = st.number_input(
+            "Resolved rows older than (days)",
+            min_value=0,
+            max_value=3650,
+            value=14,
+            step=1,
+            help="0 = all APPROVED/DELETED alerts, regardless of age.",
+            key="cleanup_older_days",
+        )
+        st.caption(
+            "Purge removes **APPROVED** / **DELETED** rows from Supabase. "
+            "Gmail is not changed by that action."
+        )
+
+        if st.button(
+            "Purge resolved alerts",
+            type="primary",
+            use_container_width=True,
+            key="purge_resolved_btn",
+        ):
+            try:
+                deleted = purge_resolved_alerts(
+                    client,
+                    older_than_days=int(older_days),
+                )
+                st.success(f"Removed {deleted} resolved alert row(s).")
+                st.rerun()
+            except DatabaseError as exc:
+                st.error(str(exc))
+
+        if st.button(
+            "Clear VT URLs on resolved (keep rows)",
+            use_container_width=True,
+            key="clear_vt_btn",
+        ):
+            try:
+                updated = clear_vt_fields_on_resolved(
+                    client,
+                    older_than_days=int(older_days),
+                )
+                st.success(f"Cleared VirusTotal URL fields on {updated} row(s).")
+                st.rerun()
+            except DatabaseError as exc:
+                st.error(str(exc))
+
+        st.divider()
+        st.caption(
+            f"Also expire **PENDING** alerts older than {PENDING_RETENTION_DAYS} days: "
+            "move mail from SOAR Review back to Inbox, then delete the Supabase row."
+        )
+        if st.button(
+            f"Expire pending older than {PENDING_RETENTION_DAYS} days now",
+            use_container_width=True,
+            key="expire_pending_btn",
+        ):
+            try:
+                with st.spinner("Expiring stale pending alerts…"):
+                    result = expire_stale_pending_alerts(
+                        settings,
+                        client,
+                        older_than_days=PENDING_RETENTION_DAYS,
+                    )
+                st.success(
+                    f"Expired {result['expired']} pending alert(s) "
+                    f"(restored to Inbox {result['gmail_restored']}, "
+                    f"Gmail failed {result['gmail_failed']})."
+                )
+                st.rerun()
+            except (DatabaseError, GmailError) as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                st.error(f"Pending expiry failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -678,7 +865,26 @@ def main() -> None:
     )
 
     settings, client = get_runtime()
-    render_detection_rules_sidebar(client)
+
+    # Expire stale PENDING alerts once per browser session (also runs on Scan).
+    if not st.session_state.get("_pending_expiry_ran"):
+        try:
+            expiry = expire_stale_pending_alerts(
+                settings,
+                client,
+                older_than_days=PENDING_RETENTION_DAYS,
+            )
+            st.session_state["_pending_expiry_ran"] = True
+            if expiry.get("expired"):
+                st.toast(
+                    f"Expired {expiry['expired']} pending alert(s) "
+                    f"older than {PENDING_RETENTION_DAYS} days."
+                )
+        except Exception as exc:
+            st.session_state["_pending_expiry_ran"] = True
+            logger.warning("Session pending expiry skipped: %s", exc)
+
+    render_detection_rules_sidebar(settings, client)
 
     scan_col, info_col = st.columns([1, 3])
     with scan_col:
@@ -710,7 +916,12 @@ def main() -> None:
                 f"scanned {stats['scanned']}, "
                 f"quarantined {stats['quarantined']}, "
                 f"clean {stats['clean']}, "
-                f"duplicates skipped {stats['skipped_dup']}."
+                f"duplicates skipped {stats['skipped_dup']}"
+                + (
+                    f", expired pending {stats['expired_pending']}."
+                    if stats.get("expired_pending")
+                    else "."
+                )
             )
         except ConfigurationError as exc:
             st.error(str(exc))

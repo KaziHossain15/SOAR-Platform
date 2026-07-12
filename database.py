@@ -332,3 +332,186 @@ def update_alert_vt(
     except Exception as exc:
         logger.exception("Failed to update VT fields uid=%s", gmail_uid)
         raise DatabaseError(f"Failed to update VirusTotal fields: {exc}") from exc
+
+
+def count_alerts_by_status(client: Client) -> dict[str, int]:
+    """Return alert counts keyed by status (PENDING / APPROVED / DELETED)."""
+    counts = {
+        STATUS_PENDING: 0,
+        STATUS_APPROVED: 0,
+        STATUS_DELETED: 0,
+    }
+    try:
+        for status in list(counts):
+            response = (
+                client.table(TABLE_ALERTS)
+                .select("gmail_uid", count="exact")
+                .eq("status", status)
+                .execute()
+            )
+            counts[status] = int(response.count or 0)
+        counts["total"] = sum(
+            counts[s] for s in (STATUS_PENDING, STATUS_APPROVED, STATUS_DELETED)
+        )
+        logger.info("Alert counts=%s", counts)
+        return counts
+    except Exception as exc:
+        logger.exception("Failed to count alerts")
+        raise DatabaseError(f"Failed to count alerts: {exc}") from exc
+
+
+def purge_resolved_alerts(
+    client: Client,
+    *,
+    older_than_days: int = 0,
+) -> int:
+    """Delete APPROVED/DELETED alert rows (optionally older than N days).
+
+    Args:
+        older_than_days: If > 0, only delete rows with created_at older than
+            this many days. If 0, delete all resolved alerts.
+
+    Returns:
+        Number of rows deleted (best-effort from response payload).
+    """
+    from datetime import timedelta
+
+    try:
+        query = (
+            client.table(TABLE_ALERTS)
+            .delete()
+            .in_("status", [STATUS_APPROVED, STATUS_DELETED])
+        )
+        if older_than_days > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=int(older_than_days))
+            query = query.lt("created_at", cutoff.isoformat())
+
+        response = query.execute()
+        deleted = len(response.data or [])
+        logger.info(
+            "Purged %d resolved alerts (older_than_days=%s)",
+            deleted,
+            older_than_days,
+        )
+        return deleted
+    except Exception as exc:
+        logger.exception("Failed to purge resolved alerts")
+        raise DatabaseError(f"Failed to purge resolved alerts: {exc}") from exc
+
+
+def fetch_stale_pending_alerts(
+    client: Client,
+    *,
+    older_than_days: int = 7,
+) -> list[dict[str, Any]]:
+    """Return PENDING alerts older than ``older_than_days``."""
+    from datetime import timedelta
+
+    if older_than_days < 1:
+        raise DatabaseError("older_than_days must be >= 1 for pending expiry")
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=int(older_than_days))
+    try:
+        response = (
+            client.table(TABLE_ALERTS)
+            .select("*")
+            .eq("status", STATUS_PENDING)
+            .lt("created_at", cutoff.isoformat())
+            .order("created_at")
+            .execute()
+        )
+        rows = response.data or []
+        logger.info(
+            "Found %d stale PENDING alerts older than %d days",
+            len(rows),
+            older_than_days,
+        )
+        return rows
+    except Exception as exc:
+        logger.exception("Failed to fetch stale pending alerts")
+        raise DatabaseError(f"Failed to load stale pending alerts: {exc}") from exc
+
+
+def delete_alert_row(client: Client, gmail_uid: str) -> bool:
+    """Hard-delete an alert row from Supabase."""
+    try:
+        response = (
+            client.table(TABLE_ALERTS)
+            .delete()
+            .eq("gmail_uid", gmail_uid)
+            .execute()
+        )
+        deleted = bool(response.data)
+        logger.info("Hard-deleted alert row gmail_uid=%s deleted=%s", gmail_uid, deleted)
+        return deleted
+    except Exception as exc:
+        logger.exception("Failed to hard-delete alert uid=%s", gmail_uid)
+        raise DatabaseError(f"Failed to delete alert row: {exc}") from exc
+
+
+def purge_stale_pending_alerts(
+    client: Client,
+    *,
+    older_than_days: int = 7,
+) -> int:
+    """Hard-delete PENDING alert rows older than N days (DB only)."""
+    from datetime import timedelta
+
+    if older_than_days < 1:
+        raise DatabaseError("older_than_days must be >= 1 for pending expiry")
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=int(older_than_days))
+    try:
+        response = (
+            client.table(TABLE_ALERTS)
+            .delete()
+            .eq("status", STATUS_PENDING)
+            .lt("created_at", cutoff.isoformat())
+            .execute()
+        )
+        deleted = len(response.data or [])
+        logger.info(
+            "Purged %d stale PENDING alerts (older_than_days=%s)",
+            deleted,
+            older_than_days,
+        )
+        return deleted
+    except Exception as exc:
+        logger.exception("Failed to purge stale pending alerts")
+        raise DatabaseError(f"Failed to purge stale pending alerts: {exc}") from exc
+
+
+def clear_vt_fields_on_resolved(
+    client: Client,
+    *,
+    older_than_days: int = 0,
+) -> int:
+    """Clear bulky VirusTotal URL fields on resolved alerts to reclaim space."""
+    from datetime import timedelta
+
+    payload = {
+        "vt_urls": [],
+        "vt_link": None,
+        "updated_at": _utc_now_iso(),
+    }
+    try:
+        query = (
+            client.table(TABLE_ALERTS)
+            .update(payload)
+            .in_("status", [STATUS_APPROVED, STATUS_DELETED])
+        )
+        if older_than_days > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=int(older_than_days))
+            query = query.lt("created_at", cutoff.isoformat())
+
+        response = query.execute()
+        updated = len(response.data or [])
+        logger.info(
+            "Cleared VT URL fields on %d resolved alerts (older_than_days=%s)",
+            updated,
+            older_than_days,
+        )
+        return updated
+    except Exception as exc:
+        logger.exception("Failed to clear VT fields on resolved alerts")
+        raise DatabaseError(f"Failed to clear VirusTotal fields: {exc}") from exc

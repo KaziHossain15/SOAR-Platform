@@ -40,6 +40,8 @@ Gmail INBOX ──scan──► Keyword triage (+ VirusTotal)
 | **VirusTotal** | Optional API key; shows malicious engine count next to threat score; **Rescan VT** per alert. |
 | **Lookback** | Only the newest 100 inbox messages are considered (avoids huge unread backlogs). |
 | **Quarantine** | IMAP move to `SOAR Review`; UIDs tracked per folder. |
+| **Pending retention** | Pending alerts older than **7 days** are auto-expired: mail returns to Inbox, Supabase row is deleted. |
+| **Database cleanup** | Sidebar tools to purge resolved alerts and free Supabase storage on the free tier. |
 | **Diagnostics** | `diagnose_inbox.py` and unit tests under `tests/`. |
 
 ---
@@ -146,6 +148,16 @@ streamlit run app.py
 5. **Rescan VT** — re-extract links and refresh VirusTotal results for that alert.
 6. **Approve** — return the message to Inbox and mark the alert `APPROVED`.
 7. **Delete** — permanently remove from `SOAR Review` and mark `DELETED`.
+8. **Database Cleanup (sidebar)** — view alert counts; purge `APPROVED` / `DELETED` rows; optionally clear VirusTotal URL payloads on resolved alerts; manually expire stale pending alerts.
+
+### Pending alert retention
+
+Pending alerts older than **7 days** expire automatically (on each **Scan Inbox**, and once per browser session):
+
+1. The quarantined message is **moved from `SOAR Review` back to Inbox** (same as Approve).
+2. The Supabase alert row is **hard-deleted**.
+
+This keeps the free-tier database small without permanently deleting mail you never reviewed. You can also trigger expiry from **Database Cleanup**.
 
 ---
 
@@ -193,6 +205,7 @@ python diagnose_inbox.py
 | White / blank UI | Theme + old HTML cards (fixed) | Refresh after latest image rebuild |
 | VirusTotal always `n/a` | Key missing, alert predates VT, or no links | Set key, restart Docker, click **Rescan VT**; confirm body/HTML has links |
 | DB insert errors on `vt_*` | Schema not migrated | Run `migrate_vt.sql` in Supabase |
+| Supabase storage growing | Resolved / stale alerts kept forever | Use **Database Cleanup**; pending auto-expires after 7 days |
 
 ---
 
