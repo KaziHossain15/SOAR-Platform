@@ -6,6 +6,9 @@ and support human approve / delete workflows.
 
 from __future__ import annotations
 
+import hmac
+import re
+import time
 from datetime import datetime
 from typing import Any
 
@@ -71,6 +74,10 @@ PENDING_RETENTION_DAYS = 7
 PAGE_TITLE = "SOAR Email Triage"
 PAGE_ICON = "🛡️"
 
+VT_REPORT_PREFIX = "https://www.virustotal.com/gui/url/"
+MIN_APP_PASSWORD_LENGTH = 12
+_MD_SPECIAL = re.compile(r"([\\`*_{}\[\]()#+\-.!|<>~$])")
+
 
 # ---------------------------------------------------------------------------
 # Bootstrap
@@ -97,6 +104,33 @@ def _cached_db(url: str, key: str) -> Client:
     return get_client(Settings(url, key, gmail_user="", gmail_app_password=""))
 
 
+def require_login(settings: Settings) -> None:
+    """Gate the dashboard behind APP_PASSWORD (constant-time comparison)."""
+    expected = settings.app_password
+    if len(expected) < MIN_APP_PASSWORD_LENGTH:
+        st.error(
+            f"APP_PASSWORD must be set (at least {MIN_APP_PASSWORD_LENGTH} "
+            "characters) in `.env` to use the dashboard."
+        )
+        st.stop()
+    if st.session_state.get("_authed"):
+        return
+
+    with st.form("login_form"):
+        st.subheader("Sign in")
+        pw = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign in")
+    if submitted:
+        if hmac.compare_digest(pw.encode("utf-8"), expected.encode("utf-8")):
+            st.session_state["_authed"] = True
+            logger.info("Dashboard login succeeded")
+            st.rerun()
+        logger.warning("Dashboard login failed")
+        time.sleep(1.5)
+        st.error("Incorrect password.")
+    st.stop()
+
+
 def get_runtime() -> tuple[Settings, Client]:
     """Load settings and Supabase client, surfacing friendly errors."""
     try:
@@ -116,6 +150,11 @@ def get_runtime() -> tuple[Settings, Client]:
 # ---------------------------------------------------------------------------
 # Display helpers
 # ---------------------------------------------------------------------------
+
+
+def md_escape(value: Any) -> str:
+    """Escape Markdown so attacker-controlled email text renders literally."""
+    return _MD_SPECIAL.sub(r"\\\1", str(value)).replace("\n", " ")
 
 
 def score_emoji(score: int) -> str:
@@ -158,7 +197,7 @@ def load_alert_email_body(settings: Settings, alert: dict[str, Any]) -> str:
         body = (msg.body if msg else "") or "(empty body)"
     except Exception as exc:
         logger.warning("Could not load body for uid=%s: %s", uid, exc)
-        body = f"(could not load email body: {exc})"
+        body = "(could not load email body — see application logs)"
 
     # Cap size so the Streamlit page stays responsive
     if len(body) > 12000:
@@ -475,7 +514,7 @@ def render_detection_rules_sidebar(settings: Settings, client: Client) -> None:
         for r in rules:
             enabled = "on" if r.get("enabled", True) else "off"
             st.sidebar.caption(
-                f"`{r.get('keyword', '')}` · weight {r.get('weight', 0)} · {enabled}"
+                f"{md_escape(r.get('keyword', ''))} · weight {r.get('weight', 0)} · {enabled}"
             )
     else:
         st.sidebar.info("No rules found. Add one below.")
@@ -504,7 +543,7 @@ def render_detection_rules_sidebar(settings: Settings, client: Client) -> None:
                             int(new_weight),
                             new_enabled,
                         )
-                        st.success(f"Added rule: {new_kw.strip()}")
+                        st.success(f"Added rule: {md_escape(new_kw.strip())}")
                         st.rerun()
                     except DatabaseError as exc:
                         st.error(str(exc))
@@ -710,8 +749,9 @@ def render_cleanup_sidebar(settings: Settings, client: Client) -> None:
                 st.rerun()
             except (DatabaseError, GmailError) as exc:
                 st.error(str(exc))
-            except Exception as exc:
-                st.error(f"Pending expiry failed: {exc}")
+            except Exception:
+                logger.exception("Unexpected pending expiry failure")
+                st.error("Pending expiry failed — see application logs.")
 
 
 # ---------------------------------------------------------------------------
@@ -773,26 +813,27 @@ def render_alert_card(
 
     # Native Streamlit widgets (no custom HTML) so dark/light themes stay readable.
     with st.container(border=True):
-        st.markdown(f"{score_emoji(score)} **{subject}**")
-        st.write(f"**From:** {sender}")
+        st.markdown(f"{score_emoji(score)} **{md_escape(subject)}**")
+        st.markdown(f"**From:** {md_escape(sender)}")
         vt_label = format_vt_score(alert)
-        st.write(
-            f"**Threat score:** {score}  ·  **VirusTotal:** {vt_label}  ·  "
-            f"**Status:** {alert.get('status') or 'PENDING'}"
+        st.markdown(
+            f"**Threat score:** {score}  ·  **VirusTotal:** {md_escape(vt_label)}  ·  "
+            f"**Status:** {md_escape(alert.get('status') or 'PENDING')}"
         )
-        vt_link = alert.get("vt_link") or ""
+        vt_link = str(alert.get("vt_link") or "")
         vt_urls = alert.get("vt_urls") or []
-        if vt_link and vt_link != "no-links":
-            st.markdown(f"[Open VirusTotal report]({vt_link})")
+        if vt_link.startswith(VT_REPORT_PREFIX):
+            st.link_button("Open VirusTotal report", vt_link)
         elif vt_urls:
-            st.caption("Links checked: " + ", ".join(str(u) for u in vt_urls[:3]))
+            # Plain text: these are untrusted links from the email itself.
+            st.text("Links checked: " + ", ".join(str(u) for u in vt_urls[:3]))
         if not settings.virustotal_api_key:
             st.caption("Set VIRUSTOTAL_API_KEY in `.env` to enable link scanning.")
         st.caption(f"Created: {format_timestamp(alert.get('created_at'))}")
         if keywords:
-            st.write("**Matched keywords:** " + ", ".join(str(k) for k in keywords))
+            st.markdown("**Matched keywords:** " + ", ".join(md_escape(k) for k in keywords))
         else:
-            st.write("**Matched keywords:** None")
+            st.markdown("**Matched keywords:** None")
 
         with st.expander("View email body", expanded=False):
             show_key = f"show_body_{uid}"
@@ -820,9 +861,9 @@ def render_alert_card(
                 except (GmailError, DatabaseError) as exc:
                     logger.exception("Approve failed uid=%s", uid)
                     st.error(str(exc))
-                except Exception as exc:
+                except Exception:
                     logger.exception("Unexpected approve failure uid=%s", uid)
-                    st.error(f"Unexpected error while approving: {exc}")
+                    st.error("Unexpected error while approving — see application logs.")
 
         with a2:
             confirm_key = f"confirm_delete_{uid}"
@@ -841,9 +882,9 @@ def render_alert_card(
                         except (GmailError, DatabaseError) as exc:
                             logger.exception("Delete failed uid=%s", uid)
                             st.error(str(exc))
-                        except Exception as exc:
+                        except Exception:
                             logger.exception("Unexpected delete failure uid=%s", uid)
-                            st.error(f"Unexpected error while deleting: {exc}")
+                            st.error("Unexpected error while deleting — see application logs.")
                 with d2:
                     if st.button("Cancel", key=f"no_del_{uid}"):
                         st.session_state[confirm_key] = False
@@ -871,9 +912,9 @@ def render_alert_card(
                 except (ConfigurationError, GmailError, DatabaseError) as exc:
                     logger.exception("VT rescan failed uid=%s", uid)
                     st.error(str(exc))
-                except Exception as exc:
+                except Exception:
                     logger.exception("Unexpected VT rescan failure uid=%s", uid)
-                    st.error(f"VirusTotal rescan failed: {exc}")
+                    st.error("VirusTotal rescan failed — see application logs.")
 
     st.write("")
 
@@ -889,6 +930,7 @@ def main() -> None:
     )
 
     settings, client = get_runtime()
+    require_login(settings)
 
     # Expire stale PENDING alerts once per browser session (also runs on Scan).
     if not st.session_state.get("_pending_expiry_ran"):
@@ -955,9 +997,9 @@ def main() -> None:
         except DatabaseError as exc:
             logger.exception("Scan database failure")
             st.error(str(exc))
-        except Exception as exc:
+        except Exception:
             logger.exception("Unexpected scan failure")
-            st.error(f"Scan failed unexpectedly: {exc}")
+            st.error("Scan failed unexpectedly — see application logs.")
 
     st.divider()
 

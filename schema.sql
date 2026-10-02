@@ -51,32 +51,20 @@ CREATE INDEX IF NOT EXISTS idx_alerts_created_at
 
 -- ---------------------------------------------------------------------------
 -- Privileges + Row Level Security
--- For a local/demo SOAR app using the anon key, allow full access.
--- Tighten these policies before any shared/production deployment.
+-- Only the server-side service role may touch these tables. The public anon
+-- key gets nothing: RLS is enabled with no policies, and grants are revoked.
 -- ---------------------------------------------------------------------------
-GRANT USAGE ON SCHEMA public TO anon, authenticated;
+DROP POLICY IF EXISTS "Allow all on keyword_rules" ON public.keyword_rules;
+DROP POLICY IF EXISTS "Allow all on alerts" ON public.alerts;
 
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.keyword_rules TO anon, authenticated;
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.alerts TO anon, authenticated;
+REVOKE ALL ON TABLE public.keyword_rules FROM anon, authenticated;
+REVOKE ALL ON TABLE public.alerts FROM anon, authenticated;
 
 ALTER TABLE public.keyword_rules ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.alerts ENABLE ROW LEVEL SECURITY;
 
-DROP POLICY IF EXISTS "Allow all on keyword_rules" ON public.keyword_rules;
-CREATE POLICY "Allow all on keyword_rules"
-    ON public.keyword_rules
-    FOR ALL
-    TO anon, authenticated
-    USING (true)
-    WITH CHECK (true);
-
-DROP POLICY IF EXISTS "Allow all on alerts" ON public.alerts;
-CREATE POLICY "Allow all on alerts"
-    ON public.alerts
-    FOR ALL
-    TO anon, authenticated
-    USING (true)
-    WITH CHECK (true);
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.keyword_rules TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.alerts TO service_role;
 
 -- ---------------------------------------------------------------------------
 -- Seed detection rules (skip if keyword already exists)

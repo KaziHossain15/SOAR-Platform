@@ -2,7 +2,8 @@ services:
   soar:
     build: .
     ports:
-      - "8501:8501"
+      # Localhost only — the dashboard can approve/delete mail in your Gmail.
+      - "127.0.0.1:8501:8501"
     env_file:
       - .env
     restart: unless-stopped

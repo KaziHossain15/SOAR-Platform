@@ -19,8 +19,11 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY *.py ./
-COPY tests ./tests
+RUN useradd --create-home --uid 10001 soar
+
+COPY --chown=soar:soar *.py ./
+
+USER soar
 
 EXPOSE 8501
 

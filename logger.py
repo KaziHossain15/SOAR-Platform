@@ -27,13 +27,43 @@ _SENSITIVE_KEYS = frozenset(
 )
 
 
+_REDACTED = "***REDACTED***"
+_SECRET_VALUES: set[str] = set()
+
+
+def register_secret(value: Optional[str]) -> None:
+    """Mask ``value`` wherever it appears in subsequent log output."""
+    if value and len(value) >= 6:
+        _SECRET_VALUES.add(value)
+
+
+def mask_email(address: Optional[str]) -> str:
+    """Return ``j***@example.com`` style masking for log output."""
+    if not address or "@" not in address:
+        return "***"
+    local, _, domain = address.partition("@")
+    return f"{local[:1]}***@{domain}"
+
+
 class _RedactingFilter(logging.Filter):
-    """Strip known secret field names from LogRecord extras."""
+    """Redact secret extras and any registered secret values in messages."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         for key in list(record.__dict__):
             if key.lower() in _SENSITIVE_KEYS:
-                record.__dict__[key] = "***REDACTED***"
+                record.__dict__[key] = _REDACTED
+        if _SECRET_VALUES:
+            try:
+                message = record.getMessage()
+            except Exception:
+                return True
+            redacted = message
+            for secret in _SECRET_VALUES:
+                if secret in redacted:
+                    redacted = redacted.replace(secret, _REDACTED)
+            if redacted != message:
+                record.msg = redacted
+                record.args = None
         return True
 
 

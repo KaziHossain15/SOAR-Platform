@@ -6,11 +6,13 @@ variables first, then Streamlit secrets as a fallback.
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 from dataclasses import dataclass
 from typing import Optional
 
-from logger import get_logger
+from logger import get_logger, mask_email, register_secret
 
 logger = get_logger(__name__)
 
@@ -59,6 +61,25 @@ class Settings:
     gmail_user: str
     gmail_app_password: str
     virustotal_api_key: str = ""
+    app_password: str = ""
+
+
+def _supabase_key_role(key: str) -> Optional[str]:
+    """Best-effort role detection for a Supabase API key (no verification)."""
+    if key.startswith("sb_publishable_"):
+        return "anon"
+    if key.startswith("sb_secret_"):
+        return "service_role"
+    parts = key.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        padded = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+        role = payload.get("role")
+        return str(role) if role else None
+    except Exception:
+        return None
 
 
 def _read_secret(key: str) -> Optional[str]:
@@ -105,17 +126,35 @@ def load_settings() -> Settings:
         logger.error("Configuration incomplete: missing %s", joined)
         raise ConfigurationError(message)
 
+    supabase_key = _read_secret("SUPABASE_KEY") or ""
+    if _supabase_key_role(supabase_key) == "anon":
+        logger.error("SUPABASE_KEY is a public anon/publishable key; refusing to start")
+        raise ConfigurationError(
+            "SUPABASE_KEY is the public anon/publishable key. Tables are locked "
+            "down to the service role — set SUPABASE_KEY to the service_role / "
+            "secret key (Supabase → Project Settings → API) and keep it server-side."
+        )
+
     vt_key = _read_secret("VIRUSTOTAL_API_KEY") or ""
     settings = Settings(
         supabase_url=_read_secret("SUPABASE_URL") or "",
-        supabase_key=_read_secret("SUPABASE_KEY") or "",
+        supabase_key=supabase_key,
         gmail_user=_read_secret("GMAIL_USER") or "",
         gmail_app_password=_read_secret("GMAIL_APP_PASSWORD") or "",
         virustotal_api_key=vt_key,
+        app_password=_read_secret("APP_PASSWORD") or "",
     )
+    for secret in (
+        settings.supabase_key,
+        settings.gmail_app_password,
+        settings.virustotal_api_key,
+        settings.app_password,
+    ):
+        register_secret(secret)
+
     logger.info(
         "Configuration loaded for Gmail user=%s supabase_host=%s virustotal=%s",
-        settings.gmail_user,
+        mask_email(settings.gmail_user),
         settings.supabase_url.split("//")[-1].split("/")[0] if settings.supabase_url else "unknown",
         "configured" if settings.virustotal_api_key else "disabled",
     )

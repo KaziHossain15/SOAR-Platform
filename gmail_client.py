@@ -21,9 +21,19 @@ from config import (
     SOAR_REVIEW_FOLDER,
     Settings,
 )
-from logger import get_logger
+from logger import get_logger, mask_email
 
 logger = get_logger(__name__)
+
+# Partial-fetch cap so a single oversized message cannot exhaust memory/CPU.
+MAX_MESSAGE_BYTES = 5 * 1024 * 1024
+# Cap HTML fed to regex-based tag stripping (pathological markup is quadratic).
+MAX_HTML_CHARS = 1_000_000
+
+# Message-IDs are attacker-controlled and are sent to IMAP SEARCH; only allow
+# the RFC 5322 msg-id shape with printable ASCII and no quote/backslash.
+_MSGID_RE = re.compile(r"^<[\x21-\x7e]{1,900}>$")
+_UID_RE = re.compile(r"^\d{1,20}$")
 
 
 class GmailError(Exception):
@@ -68,7 +78,7 @@ class GmailClient:
                 "Connecting to IMAP host=%s port=%s user=%s",
                 IMAP_HOST,
                 IMAP_PORT,
-                self._settings.gmail_user,
+                mask_email(self._settings.gmail_user),
             )
             self._conn = imaplib.IMAP4_SSL(
                 IMAP_HOST,
@@ -295,10 +305,11 @@ class GmailClient:
 
     def _fetch_uid(self, uid: str) -> Optional[EmailMessage]:
         """Fetch a message by UID without setting \\Seen (BODY.PEEK)."""
+        uid = _require_uid(uid)
         conn = self._require_conn()
         # RFC822 sets \\Seen; BODY.PEEK[] leaves unread mail unread so a
         # clean score does not silently remove the message from UNSEEN.
-        status, data = conn.uid("fetch", uid, "(BODY.PEEK[])")
+        status, data = conn.uid("fetch", uid, f"(BODY.PEEK[]<0.{MAX_MESSAGE_BYTES}>)")
         if status != "OK" or not data or data[0] is None:
             logger.warning("Could not fetch UID=%s status=%s", uid, status)
             return None
@@ -316,7 +327,7 @@ class GmailClient:
         urls = extract_urls(subject, body, html, limit=20)
         return EmailMessage(
             gmail_uid=str(uid),
-            message_id=_header_value(msg, "Message-ID") or f"uid-{uid}",
+            message_id=_safe_message_id(_header_value(msg, "Message-ID")) or f"uid-{uid}",
             sender=_header_value(msg, "From") or "unknown",
             subject=subject,
             body=body,
@@ -335,13 +346,64 @@ class GmailClient:
         message_id: Optional[str] = None,
     ) -> Optional[EmailMessage]:
         """Fetch a single message from ``folder`` by UID (Message-ID fallback)."""
-        resolved = str(uid)
-        if message_id:
-            found = self.find_uid_by_message_id(message_id, folder)
-            if found:
-                resolved = found
+        try:
+            resolved = self._resolve_uid(uid, folder, message_id)
+        except GmailError as exc:
+            logger.warning("fetch_message could not resolve uid=%s: %s", uid, exc)
+            return None
         self.select_folder(folder, readonly=True)
         return self._fetch_uid(resolved)
+
+    def _message_id_at_uid(self, uid: str) -> Optional[str]:
+        """Return the Message-ID at ``uid`` in the selected folder.
+
+        Returns ``None`` if the UID does not exist, ``""`` if the message has
+        no usable Message-ID header.
+        """
+        conn = self._require_conn()
+        status, fetched = conn.uid(
+            "fetch",
+            _require_uid(uid),
+            "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
+        )
+        if status != "OK" or not fetched:
+            return None
+        blob = _extract_fetch_bytes(fetched)
+        if blob is None:
+            return None
+        header_msg = email.message_from_bytes(blob)
+        return _safe_message_id(_header_value(header_msg, "Message-ID")) or ""
+
+    def _resolve_uid(
+        self,
+        uid: str,
+        folder: str,
+        message_id: Optional[str] = None,
+    ) -> str:
+        """Resolve the UID to act on in ``folder``, verifying its identity.
+
+        The stored UID is preferred and accepted only if the message there
+        still carries the expected Message-ID. Message-ID lookup is a fallback
+        and must match exactly one message, so a spoofed duplicate
+        Message-ID cannot redirect approve/delete to a different email.
+        """
+        safe_mid = _safe_message_id(message_id)
+        self.select_folder(folder, readonly=True)
+
+        if _UID_RE.match(str(uid).strip()):
+            current = self._message_id_at_uid(str(uid).strip())
+            if current is not None and (safe_mid is None or current == safe_mid):
+                return str(uid).strip()
+
+        if safe_mid:
+            found = self.find_uid_by_message_id(safe_mid, folder)
+            if found:
+                return found
+
+        raise GmailError(
+            f"Could not locate the quarantined message (uid={str(uid)[:20]}) "
+            f"in '{folder}'. It may have been moved or deleted in Gmail."
+        )
 
     def move_message(
         self,
@@ -359,6 +421,7 @@ class GmailClient:
             UID of the message in the destination folder (IMAP UIDs are
             per-mailbox; the destination UID often differs from ``uid``).
         """
+        uid = _require_uid(uid)
         self.select_folder(source, readonly=False)
         conn = self._require_conn()
 
@@ -387,6 +450,7 @@ class GmailClient:
         source: str,
         message_id: Optional[str] = None,
     ) -> str:
+        uid = _require_uid(uid)
         conn = self._require_conn()
         self.select_folder(source, readonly=False)
 
@@ -434,47 +498,45 @@ class GmailClient:
         message_id: str,
         folder: str,
     ) -> Optional[str]:
-        """Locate a message UID in ``folder`` by Message-ID header."""
-        if not message_id:
+        """Locate a message UID in ``folder`` by exact Message-ID match.
+
+        Returns ``None`` when the Message-ID is malformed, not found, or
+        ambiguous (more than one message carries it).
+        """
+        safe_mid = _safe_message_id(message_id)
+        if not safe_mid:
             return None
         conn = self._require_conn()
         try:
             self.select_folder(folder, readonly=True)
-            # HEADER search is widely supported on Gmail
-            status, data = conn.uid("search", None, "HEADER", "Message-ID", message_id)
+            # HEADER search is a substring match; confirm each hit exactly.
+            status, data = conn.uid(
+                "search", None, "HEADER", "Message-ID", f'"{safe_mid}"'
+            )
+            candidates: list[str] = []
             if status == "OK" and data and data[0]:
-                uids = data[0].decode("utf-8", errors="replace").split()
-                if uids:
-                    return uids[-1]
+                candidates = _parse_uid_list(data[0])
+            if not candidates:
+                # Fallback: scan the newest messages' Message-ID headers
+                status, data = conn.uid("search", None, "ALL")
+                if status != "OK" or not data or not data[0]:
+                    return None
+                candidates = _parse_uid_list(data[0])[-50:]
 
-            # Fallback: scan recent messages' Message-ID headers
-            status, data = conn.uid("search", None, "ALL")
-            if status != "OK" or not data or not data[0]:
-                return None
-            uids = data[0].decode("utf-8", errors="replace").split()
-            needle = message_id.encode("utf-8")
-            for candidate in reversed(uids[-50:]):
-                status, fetched = conn.uid(
-                    "fetch",
-                    candidate,
-                    "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
+            matches = [
+                uid for uid in candidates if self._message_id_at_uid(uid) == safe_mid
+            ]
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                logger.warning(
+                    "Ambiguous Message-ID in folder=%s (%d matches); refusing to pick one",
+                    folder,
+                    len(matches),
                 )
-                if status != "OK" or not fetched:
-                    continue
-                blob = b""
-                for part in fetched:
-                    if isinstance(part, tuple) and len(part) > 1:
-                        blob = part[1] or b""
-                        break
-                if needle in blob:
-                    return candidate
             return None
         except Exception:
-            logger.warning(
-                "Message-ID lookup failed message_id=%s folder=%s",
-                message_id,
-                folder,
-            )
+            logger.warning("Message-ID lookup failed folder=%s", folder)
             return None
 
     def delete_message(
@@ -486,11 +548,7 @@ class GmailClient:
         """Permanently delete a message from the given folder."""
         conn = self._require_conn()
         try:
-            resolved = uid
-            if message_id:
-                found = self.find_uid_by_message_id(message_id, folder)
-                if found:
-                    resolved = found
+            resolved = self._resolve_uid(uid, folder, message_id)
             self.select_folder(folder, readonly=False)
             store_status, _ = conn.uid("STORE", resolved, "+FLAGS", r"(\Deleted)")
             if store_status != "OK":
@@ -513,11 +571,7 @@ class GmailClient:
     ) -> None:
         """Move a quarantined message back to INBOX."""
         self.ensure_folder(folder)
-        resolved = uid
-        if message_id:
-            found = self.find_uid_by_message_id(message_id, folder)
-            if found:
-                resolved = found
+        resolved = self._resolve_uid(uid, folder, message_id)
         self.move_message(
             resolved,
             destination="INBOX",
@@ -530,6 +584,27 @@ class GmailClient:
 # ---------------------------------------------------------------------------
 # Parsing helpers
 # ---------------------------------------------------------------------------
+
+
+def _safe_message_id(value: Optional[str]) -> Optional[str]:
+    """Return ``value`` if it is a well-formed, IMAP-safe Message-ID."""
+    v = (value or "").strip()
+    if not _MSGID_RE.match(v) or '"' in v or "\\" in v:
+        return None
+    return v
+
+
+def _require_uid(uid: object) -> str:
+    """Validate an IMAP UID before it is interpolated into a command."""
+    s = str(uid).strip()
+    if not _UID_RE.match(s):
+        raise GmailError(f"Invalid IMAP UID: {s[:40]!r}")
+    return s
+
+
+def _parse_uid_list(blob: bytes | str) -> list[str]:
+    text = blob.decode("utf-8", errors="replace") if isinstance(blob, bytes) else str(blob)
+    return [u for u in text.split() if _UID_RE.match(u)]
 
 
 def _quote_mailbox(name: str) -> str:
@@ -676,6 +751,7 @@ def _strip_html(html: str) -> str:
     """Strip tags but keep discovered http(s) links appended for triage/VT."""
     from virustotal import extract_urls
 
+    html = html[:MAX_HTML_CHARS]
     preserved = extract_urls(html, limit=50)
     text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html)
     text = re.sub(r"(?s)<[^>]+>", " ", text)
